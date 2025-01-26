@@ -5,7 +5,7 @@ This is a multi-agent system that helps users with property-related queries usin
 ## Architecture
 
 The system consists of three main agents:
-1. **Property Agent**: Handles queries about property details, features, and locations
+1. **Pet Policy Agent**: Handles queries about Pet Policy.
 2. **Payment Agent**: Handles queries about prices, payment terms, and financial aspects
 3. **Supervisor Agent**: Orchestrates the collaboration between specialized agents
 
