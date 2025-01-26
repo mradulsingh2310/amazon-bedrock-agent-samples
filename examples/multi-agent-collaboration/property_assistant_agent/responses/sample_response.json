@@ -1,0 +1,42 @@
+{
+  "timestamp": "20240325_143000",
+  "query": "what are the pet policies and associated fees?",
+  "trace_level": "core",
+  "response": {
+    "query_analysis": {
+      "type": "multi_agent",
+      "agents_involved": ["pet_policy_agent", "payment_agent"]
+    },
+    "pet_policy_response": {
+      "policies": {
+        "allowed_pets": "Yes, pets are allowed",
+        "restrictions": {
+          "types": ["dogs", "cats"],
+          "size_limits": "Details from knowledge base",
+          "breed_restrictions": "Details from knowledge base"
+        },
+        "documentation": {
+          "required_documents": ["pet registration", "vaccination records"],
+          "registration_process": "Details from knowledge base"
+        }
+      }
+    },
+    "payment_response": {
+      "fees": {
+        "pet_deposit": "Amount from knowledge base",
+        "monthly_pet_rent": "Amount from knowledge base",
+        "one_time_fees": "Details from knowledge base",
+        "payment_methods": {
+          "accepted_methods": ["Details from knowledge base"],
+          "payment_schedule": "Details from knowledge base"
+        }
+      }
+    },
+    "combined_response": "Final formatted response combining both agent outputs",
+    "trace_info": {
+      "execution_path": ["supervisor", "pet_policy_agent", "payment_agent"],
+      "processing_time": "timestamp",
+      "knowledge_base_accessed": true
+    }
+  }
+} 
