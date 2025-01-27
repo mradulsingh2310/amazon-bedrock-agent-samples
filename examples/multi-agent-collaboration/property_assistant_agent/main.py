@@ -9,6 +9,10 @@ import json
 from datetime import datetime
 from dotenv import load_dotenv
 import boto3
+from semantic_kernel.contents.chat_history import ChatHistory
+import io
+import sys
+from contextlib import redirect_stdout
 
 # Load environment variables
 load_dotenv()
@@ -19,51 +23,136 @@ from src.utils.bedrock_agent import Agent, SupervisorAgent, Task
 from src.utils.bedrock_agent_helper import AgentsForAmazonBedrock
 import argparse
 
-def save_response_to_json(query, result, trace_level):
-    """Save the query response to a JSON file with timestamp"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    response_data = {
-        "timestamp": timestamp,
-        "query": query,
-        "trace_level": trace_level,
-        "response": result,
-    }
-    
-    # Create responses directory if it doesn't exist
-    responses_dir = os.path.join(os.path.dirname(__file__), "responses")
-    os.makedirs(responses_dir, exist_ok=True)
-    
-    # Save to JSON file
-    filename = f"response_{timestamp}.json"
-    filepath = os.path.join(responses_dir, filename)
-    with open(filepath, 'w') as f:
-        json.dump(response_data, f, indent=2)
-    
-    print(f"\nResponse saved to: {filepath}")
+class ConversationManager:
+    def __init__(self, supervisor, trace_level="core"):
+        self.supervisor = supervisor
+        self.trace_level = trace_level
+        self.chat_history = ChatHistory()
+        self.conversation_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.conversation_file = os.path.join(os.path.dirname(__file__), "responses", "conversations.json")
+        self.initialize_conversation_file()
 
-def process_query(query, supervisor, trace_level="core"):
-    """Process a query and save the response"""
-    try:
-        print(f"\nProcessing query: {query}")
-        print("-" * 50)
+    def initialize_conversation_file(self):
+        """Initialize or load the conversation JSON file"""
+        responses_dir = os.path.join(os.path.dirname(__file__), "responses")
+        os.makedirs(responses_dir, exist_ok=True)
         
-        result = supervisor.invoke(
-            query,
-            enable_trace=True,
-            trace_level=trace_level
-        )
+        if not os.path.exists(self.conversation_file):
+            # Create new file if it doesn't exist
+            conversation_data = {
+                "conversations": []
+            }
+            with open(self.conversation_file, 'w') as f:
+                json.dump(conversation_data, f, indent=2)
         
-        # Save response to JSON
-        save_response_to_json(query, result, trace_level)
+        # Add new conversation entry
+        with open(self.conversation_file, 'r') as f:
+            conversation_data = json.load(f)
         
-        print("\nResponse:")
-        print("-" * 50)
-        print(result)
-        print("-" * 50)
-        return result
-    except Exception as e:
-        print(f"Error processing query: {str(e)}")
-        return None
+        new_conversation = {
+            "conversation_id": self.conversation_id,
+            "start_time": self.conversation_id,
+            "messages": []
+        }
+        
+        conversation_data["conversations"].append(new_conversation)
+        
+        with open(self.conversation_file, 'w') as f:
+            json.dump(conversation_data, f, indent=2)
+
+    def save_to_conversation(self, user_input, response, trace_output, invoked_agents):
+        """Append new messages to the conversation JSON file with enhanced trace information"""
+        try:
+            with open(self.conversation_file, 'r') as f:
+                conversation_data = json.load(f)
+            
+            trace_lines = trace_output.split('\n')
+            
+            # Find current conversation
+            for conv in conversation_data["conversations"]:
+                if conv["conversation_id"] == self.conversation_id:
+                    # Add new message pair with enhanced agent information
+                    message_pair = {
+                        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                        "user_input": user_input,
+                        "response": response,
+                        "trace_level": self.trace_level,
+                        "invoked_agents": invoked_agents,
+                        "agent_trace": {
+                            "request_id": next((line.split("request ID: ")[1] for line in trace_lines if "request ID:" in line), None),
+                            "session_id": next((line.split("session ID: ")[1] for line in trace_lines if "session ID:" in line), None),
+                            "agent_steps": [line for line in trace_lines if "Step" in line and "----" in line],
+                            "complete_trace": trace_output
+                        }
+                    }
+                    conv["messages"].append(message_pair)
+                    break
+            
+            # Save updated conversations
+            with open(self.conversation_file, 'w') as f:
+                json.dump(conversation_data, f, indent=2)
+                
+        except Exception as e:
+            print(f"Error saving conversation: {str(e)}")
+
+    def process_input(self, user_input):
+        """Process user input and maintain chat history"""
+        try:
+            # Add user message to chat history
+            self.chat_history.add_user_message(user_input)
+            
+            print(f"\nProcessing: {user_input}")
+            print("-" * 50)
+            
+            # Capture stdout to get the complete trace
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                # Get response from supervisor with trace information
+                result = self.supervisor.invoke(
+                    user_input,
+                    enable_trace=True,
+                    trace_level=self.trace_level
+                )
+            
+            # Get the complete trace output
+            trace_output = stdout.getvalue()
+            
+            # Add assistant response to chat history
+            self.chat_history.add_assistant_message(result)
+            
+            # Extract agent information from the complete trace
+            invoked_agents = []
+            trace_lines = trace_output.split('\n')
+            
+            # More detailed parsing of trace output
+            current_agent = None
+            for line in trace_lines:
+                if "sub-agent name:" in line:
+                    agent_info = line.split("sub-agent name:")[1].split(',')[0].strip()
+                    if agent_info not in invoked_agents:
+                        invoked_agents.append(agent_info)
+                        current_agent = agent_info
+                elif "agent id:" in line and current_agent:
+                    agent_id = line.split("agent id:")[1].split(',')[0].strip()
+                    if current_agent and agent_id not in invoked_agents:
+                        invoked_agents.append(f"{current_agent} ({agent_id})")
+            
+            # Save to conversation file with enhanced trace information
+            self.save_to_conversation(user_input, result, trace_output, invoked_agents)
+            
+            print("\nResponse:")
+            print("-" * 50)
+            print(result)
+            print("-" * 50)
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"Error processing input: {str(e)}"
+            print(error_msg)
+            self.chat_history.add_assistant_message(error_msg)
+            self.save_to_conversation(user_input, error_msg, "", [])
+            return None
 
 def setup_aws_credentials():
     session = boto3.Session(
@@ -73,6 +162,28 @@ def setup_aws_credentials():
         region_name=os.getenv("AWS_DEFAULT_REGION"),
     )
     return session
+
+def interactive_session(conversation_manager):
+    """Run an interactive chat session"""
+    print("\nWelcome to the Property Assistant! (Type 'exit' to end the conversation)")
+    print("-" * 50)
+    
+    while True:
+        try:
+            user_input = input("\nYou: ").strip()
+            
+            if user_input.lower() in ['exit', 'quit', 'bye']:
+                print("\nThank you for using the Property Assistant. Goodbye!")
+                break
+                
+            conversation_manager.process_input(user_input)
+            
+        except KeyboardInterrupt:
+            print("\n\nConversation interrupted. Saving and exiting...")
+            break
+        except Exception as e:
+            print(f"\nError: {str(e)}")
+            print("Please try again or type 'exit' to end the conversation.")
 
 def main(args):
     session = setup_aws_credentials()
@@ -104,27 +215,42 @@ def main(args):
         pet_policy_agent = Agent.direct_create(
             name="pet_policy_agent",
             role="Pet Policy Specialist",
-            goal="Handle all pet-related queries and policies for properties",
+            goal="Provide precise and relevant information about property pet policies",
             instructions="""
-            You are a specialized Pet Policy expert who will:
-            - Provide detailed information about pet policies for properties
-            - Explain pet restrictions, size limits, and breed restrictions
-            - Detail pet deposits, fees, and additional charges
-            - Clarify pet amenities (dog parks, washing stations, etc.)
-            - Answer questions about service animals and emotional support animals
-            - Explain pet registration and documentation requirements
-            - Provide information about nearby pet services (vets, pet stores, etc.)
+            You are a specialized Pet Policy expert. Follow these guidelines strictly:
+
+            VERY IMPORTANT:
+            - You MUST ALWAYS provide the information from the knowledge base, do not make up information on your own.
+
+            RESPONSE GUIDELINES:
+            1. Answer ONLY pet-related queries
+            2. Keep responses direct, concise, and relevant to the specific question
+            3. If a query is not pet-related, politely redirect to the appropriate agent
+            4. Use bullet points for clarity when listing multiple items
+            5. Always cite specific policy details from the knowledge base
             
-            Use the knowledge base to ensure accurate and up-to-date information.
-            Always clarify the difference between service animals and pets when relevant.
-            Provide specific details about:
-            1. Allowed pet types and breeds
-            2. Size and weight restrictions
-            3. Number of pets allowed per unit
-            4. Pet-related fees and deposits
-            5. Required pet documentation
-            6. Pet amenities and facilities
-            """,
+            EXPERTISE BOUNDARIES:
+            ✓ DO ANSWER:
+            - Current pet policy details for the property
+            - Pet fees, deposits, and recurring charges
+            - Breed and size restrictions
+            - Number of pets allowed
+            - Service/support animal policies
+            - Pet documentation requirements
+            
+            × DO NOT ANSWER:
+            - General property questions
+            - Payment processes not related to pet fees
+            - Maintenance issues not specific to pets
+            - Lease terms unrelated to pets
+            
+            RESPONSE FORMAT:
+            1. Start with a direct answer to the query
+            2. Provide only relevant supporting details
+            3. Include specific numbers/amounts when available
+            4. End with any required next steps or documentation needs
+            
+            Remember: Stay within your pet policy expertise and provide only information that directly answers the user's query.""",
             llm=os.getenv("MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"),
             kb_id=os.getenv("KNOWLEDGE_BASE_ID"),
             kb_descr=os.getenv("KNOWLEDGE_BASE_DESCRIPTION"),
@@ -132,32 +258,43 @@ def main(args):
         
         payment_agent = Agent.direct_create(
             name="payment_agent",
-            role="Payment Specialist",
-            goal="Handle all payment and financial aspects of property rentals and purchases",
+            role="Payment and Billing Specialist",
+            goal="Provide accurate and specific information about property payments and financial matters",
             instructions="""
-            You are an expert Payment Specialist who will:
-            - Provide comprehensive information about all payment options and methods
-            - Explain detailed payment terms, schedules, and due dates
-            - Detail all fees, deposits, and additional charges
-            - Clarify payment processing timeframes and procedures
-            - Handle questions about:
-                * Rent/purchase payment methods
-                * Security deposits and refund policies
-                * Late payment policies and fees
-                * Payment portal usage and online payments
-                * Automatic payment setup
-                * Payment documentation and receipts
-                * Special payment arrangements
+            You are a specialized Payment and Billing expert. Follow these guidelines strictly:
+
+            VERY IMPORTANT:
+            - You MUST ALWAYS provide the information from the knowledge base, do not make up information on your own.
+
+            RESPONSE GUIDELINES:
+            1. Answer ONLY payment and billing related queries
+            2. Provide exact amounts and due dates when available
+            3. Keep responses focused on financial aspects
+            4. If a query is not payment-related, politely redirect to the appropriate agent
+            5. Always verify amounts and policies in the knowledge base
             
-            Use the knowledge base to provide accurate financial information.
-            Always be clear about:
-            1. Available payment methods
-            2. Processing times for different payment types
-            3. Required payment documentation
-            4. Fee structures and additional charges
-            5. Security deposit terms
-            6. Payment deadline policies
-            """,
+            EXPERTISE BOUNDARIES:
+            ✓ DO ANSWER:
+            - Rent amounts and due dates
+            - Accepted payment methods
+            - Late fee policies and amounts
+            - Security deposit information
+            - Utility billing procedures
+            - Rent payment portals/systems
+            
+            × DO NOT ANSWER:
+            - Pet policies
+            - Maintenance requests
+            - Amenity availability
+            - General property questions
+            
+            RESPONSE FORMAT:
+            1. State the specific financial information requested
+            2. List exact amounts and deadlines
+            3. Specify payment methods or procedures
+            4. Include any relevant payment terms or conditions
+            
+            Remember: Focus solely on financial matters and provide only information that directly addresses the user's payment-related query.""",
             llm=os.getenv("MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"),
             kb_id=os.getenv("KNOWLEDGE_BASE_ID"),
             kb_descr=os.getenv("KNOWLEDGE_BASE_DESCRIPTION"),
@@ -170,6 +307,9 @@ def main(args):
             collaboration_type="SUPERVISOR",
             instructions="""
             You are a coordinator supervisor who MUST NEVER answer queries directly. Your role is strictly to route, collect, and synthesize agent responses.
+
+            VERY IMPORTANT:
+            - YOU WILL NEVER ANSWER ANY QUESTIONS, YOU WILL ONLY COLLECT AND SYNTHESIZE RESPONSES FROM THE AGENT/AGENTS(in case of multi-agent queries).
 
             CRITICAL: MULTI-AGENT QUERY HANDLING
             ===================================
@@ -197,24 +337,19 @@ def main(args):
 
                Format for Multi-Agent Responses:
                ```
-               Combined Information from Specialist Agents:
+               Here's what you need to know:
 
-               Regarding Pet Policies:
-               [Complete response from pet_policy_agent]
+               [Combined response integrating both pet policy and payment details in a natural flow, using ONLY information provided by both agents]
 
-               Regarding Payment Details:
-               [Complete response from payment_agent]
-
-               These policies work together as follows:
-               [Simple connection of how pet policies and payments interact,
-                using ONLY information provided by the agents]
+               Note: All information above comes directly from our specialist agents.
                ```
 
             STANDARD RESPONSIBILITIES:
 
-            1. Single-Agent Routing:
+            1. Agent Routing:
                - Route pet-only queries to pet_policy_agent
                - Route payment-only queries to payment_agent
+               - Route multi-agent queries to both agents
                - Present response with minimal formatting
 
             2. Response Processing:
@@ -374,21 +509,16 @@ def main(args):
         )
         
         if args.recreate_agents == "false":
-            # Process single query
-            process_query(
-                "what are the pet policies and per month property rent charges?",
-                property_supervisor,
-                args.trace_level
+            # Initialize conversation manager
+            conversation_manager = ConversationManager(
+                supervisor=property_supervisor,
+                trace_level=args.trace_level
             )
-
-            process_query(
-                "What is the payment link for this property?",
-                property_supervisor,
-                args.trace_level
-            )
+            
+            # Start interactive session
+            interactive_session(conversation_manager)
         else:
             print("Recreated agents.")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
