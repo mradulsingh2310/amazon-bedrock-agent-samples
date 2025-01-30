@@ -60,8 +60,8 @@ class ConversationManager:
         with open(self.conversation_file, 'w') as f:
             json.dump(conversation_data, f, indent=2)
 
-    def save_to_conversation(self, user_input, response, trace_output, invoked_agents):
-        """Append new messages to the conversation JSON file with enhanced trace information"""
+    def save_to_conversation(self, user_input, response, trace_output, invoked_agents, metadata=None):
+        """Append new messages to the conversation JSON file with enhanced trace information and metadata"""
         try:
             with open(self.conversation_file, 'r') as f:
                 conversation_data = json.load(f)
@@ -71,13 +71,14 @@ class ConversationManager:
             # Find current conversation
             for conv in conversation_data["conversations"]:
                 if conv["conversation_id"] == self.conversation_id:
-                    # Add new message pair with enhanced agent information
+                    # Add new message pair with enhanced agent information and metadata
                     message_pair = {
                         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
                         "user_input": user_input,
                         "response": response,
                         "trace_level": self.trace_level,
                         "invoked_agents": invoked_agents,
+                        "metadata": metadata,
                         "agent_trace": {
                             "request_id": next((line.split("request ID: ")[1] for line in trace_lines if "request ID:" in line), None),
                             "session_id": next((line.split("session ID: ")[1] for line in trace_lines if "session ID:" in line), None),
@@ -98,27 +99,69 @@ class ConversationManager:
     def process_input(self, user_input):
         """Process user input and maintain chat history"""
         try:
-            # Add user message to chat history
-            self.chat_history.add_user_message(user_input)
+            # Create metadata for the prompt
+            metadata = {
+                "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                "session_id": self.conversation_id,
+                "property_id": 345,
+                "user_info": {
+                    "conversation_history": len(self.chat_history.messages),
+                    "current_context": "property_assistant"
+                },
+                "request_type": "user_query",
+                "trace_settings": {
+                    "level": self.trace_level,
+                    "enable_trace": True
+                }
+            }
+            
+            # Add user message to chat history with metadata
+            self.chat_history.add_user_message(user_input, metadata=metadata)
             
             print(f"\nProcessing: {user_input}")
             print("-" * 50)
             
+            # Create session state with KB filter configuration
+            session_state = {
+                "knowledgeBaseConfigurations": [{
+                    "knowledgeBaseId": os.getenv("KNOWLEDGE_BASE_ID"),
+                    "retrievalConfiguration": {
+                        "vectorSearchConfiguration": {
+                            "numberOfResults": 3,
+                            "overrideSearchType": "HYBRID",
+                            "filter": {
+                                "equals": {
+                                    "key": "property_id",
+                                    "value": str(metadata["property_id"])
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+            
             # Capture stdout to get the complete trace
             stdout = io.StringIO()
             with redirect_stdout(stdout):
-                # Get response from supervisor with trace information
+                # Get response from supervisor with trace information and metadata
                 result = self.supervisor.invoke(
                     user_input,
                     enable_trace=True,
-                    trace_level=self.trace_level
+                    trace_level=self.trace_level,
+                    session_state=session_state  # Pass the session state with KB filter
                 )
             
             # Get the complete trace output
             trace_output = stdout.getvalue()
+            print(trace_output)
             
-            # Add assistant response to chat history
-            self.chat_history.add_assistant_message(result)
+            # Add assistant response to chat history with metadata
+            response_metadata = {
+                **metadata,
+                "response_timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                "response_type": "assistant_response"
+            }
+            self.chat_history.add_assistant_message(result, metadata=response_metadata)
             
             # Extract agent information from the complete trace
             invoked_agents = []
@@ -137,8 +180,8 @@ class ConversationManager:
                     if current_agent and agent_id not in invoked_agents:
                         invoked_agents.append(f"{current_agent} ({agent_id})")
             
-            # Save to conversation file with enhanced trace information
-            self.save_to_conversation(user_input, result, trace_output, invoked_agents)
+            # Save to conversation file with enhanced trace information and metadata
+            self.save_to_conversation(user_input, result, trace_output, invoked_agents, metadata=metadata)
             
             print("\nResponse:")
             print("-" * 50)
@@ -150,8 +193,13 @@ class ConversationManager:
         except Exception as e:
             error_msg = f"Error processing input: {str(e)}"
             print(error_msg)
-            self.chat_history.add_assistant_message(error_msg)
-            self.save_to_conversation(user_input, error_msg, "", [])
+            error_metadata = {
+                "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                "error_type": str(type(e).__name__),
+                "session_id": self.conversation_id
+            }
+            self.chat_history.add_assistant_message(error_msg, metadata=error_metadata)
+            self.save_to_conversation(user_input, error_msg, "", [], metadata=error_metadata)
             return None
 
 def setup_aws_credentials():
